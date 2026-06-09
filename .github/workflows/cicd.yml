@@ -1,0 +1,367 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# AKS 3-Tier Architecture — Full CI/CD Pipeline
+# Stages: Test → Security Scan → Build → Push ACR → Deploy AKS
+# ═══════════════════════════════════════════════════════════════════════════════
+name: CI/CD Pipeline — AKS 3-Tier App
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  ACR_NAME:          devops3tieracr
+  ACR_LOGIN_SERVER:  devops3tieracr.azurecr.io
+  AKS_RESOURCE_GROUP: rg-aks-3tier
+  AKS_CLUSTER_NAME:  aks-3tier-prod
+  K8S_NAMESPACE:     app
+  NODE_VERSION:      "20"
+
+jobs:
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1: Lint & Unit Tests (all services in parallel)
+# ─────────────────────────────────────────────────────────────────────────────
+  test:
+    name: "Test: ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, product-service, order-service]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: services/${{ matrix.service }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: services/${{ matrix.service }}
+        run: npm test -- --passWithNoTests
+        env:
+          CI: true
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.service }}
+          path: services/${{ matrix.service }}/coverage/
+        if: always()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2: Security Scanning
+# ─────────────────────────────────────────────────────────────────────────────
+  security-scan:
+    name: "Security Scan"
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 0
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        if: always()
+
+      - name: Dependency audit (user-service)
+        working-directory: services/user-service
+        run: npm audit --audit-level=high || true
+
+      - name: Dependency audit (product-service)
+        working-directory: services/product-service
+        run: npm audit --audit-level=high || true
+
+      - name: Dependency audit (order-service)
+        working-directory: services/order-service
+        run: npm audit --audit-level=high || true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 3: Build & Push Docker Images to ACR (parallel)
+# ─────────────────────────────────────────────────────────────────────────────
+  build-push:
+    name: "Build & Push: ${{ matrix.service }}"
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    strategy:
+      matrix:
+        include:
+          - service: frontend
+            context: ./frontend
+            dockerfile: ./frontend/Dockerfile
+          - service: user-service
+            context: ./services/user-service
+            dockerfile: ./services/user-service/Dockerfile
+          - service: product-service
+            context: ./services/product-service
+            dockerfile: ./services/product-service/Dockerfile
+          - service: order-service
+            context: ./services/order-service
+            dockerfile: ./services/order-service/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-8)
+          echo "image_tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_full=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.service }}:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "image_latest=${{ env.ACR_LOGIN_SERVER }}/${{ matrix.service }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR
+        run: az acr login --name ${{ env.ACR_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image_full }}
+            ${{ steps.vars.outputs.image_latest }}
+          cache-from: type=registry,ref=${{ steps.vars.outputs.image_latest }}
+          cache-to: type=inline
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Scan pushed image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.vars.outputs.image_full }}
+          format: table
+          severity: CRITICAL
+          exit-code: 0
+
+      - name: Save image tag to artifact
+        run: echo "${{ steps.vars.outputs.image_tag }}" > image-tag.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-tag-${{ matrix.service }}
+          path: image-tag.txt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4: Integration Tests (smoke test docker-compose stack)
+# ─────────────────────────────────────────────────────────────────────────────
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: build-push
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-user-service
+          path: .
+
+      - name: Read tag
+        id: tag
+        run: echo "image_tag=$(cat image-tag.txt)" >> $GITHUB_OUTPUT
+
+      - name: Start test stack
+        env:
+          ACR_NAME: ${{ env.ACR_LOGIN_SERVER }}
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          # Pull images from ACR (already logged in from previous job context)
+          docker-compose up -d postgres redis
+          sleep 15
+          docker-compose up -d user-service product-service order-service
+          sleep 20
+
+      - name: Run API smoke tests
+        run: |
+          # Health checks
+          curl -f http://localhost:3001/health || exit 1
+          curl -f http://localhost:3002/health || exit 1
+          curl -f http://localhost:3003/health || exit 1
+          echo "✅ All health checks passed"
+
+          # Create a user
+          USER=$(curl -sf -X POST http://localhost:3001/api/users \
+            -H "Content-Type: application/json" \
+            -d '{"name":"Test User","email":"test@ci.com","password":"Test@1234"}')
+          echo "Created user: $USER"
+
+          # Create a product
+          PRODUCT=$(curl -sf -X POST http://localhost:3002/api/products \
+            -H "Content-Type: application/json" \
+            -d '{"name":"Test Product","price":9.99,"stock_quantity":100}')
+          echo "Created product: $PRODUCT"
+          echo "✅ Integration tests passed"
+
+      - name: Tear down
+        if: always()
+        run: docker-compose down -v
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 5: Deploy to AKS (Rolling update for all services)
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: integration-test
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag-user-service
+          path: .
+      - id: tag
+        run: echo "image_tag=$(cat image-tag.txt)" >> $GITHUB_OUTPUT
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Apply namespace and config
+        run: |
+          kubectl apply -f k8s/namespace/namespace.yaml
+          kubectl apply -f k8s/configmaps/app-config.yaml
+          kubectl apply -f k8s/database/postgres-statefulset.yaml
+          kubectl apply -f k8s/redis/redis-statefulset.yaml
+          kubectl apply -f k8s/services/serviceaccount.yaml
+
+      - name: Wait for database to be ready
+        run: |
+          kubectl rollout status statefulset/postgres -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+          kubectl rollout status statefulset/redis    -n ${{ env.K8S_NAMESPACE }} --timeout=60s
+
+      - name: Update image tags and deploy services
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image_tag }}
+        run: |
+          SERVICES=(frontend user-service product-service order-service)
+          for SVC in "${SERVICES[@]}"; do
+            echo "▶ Deploying $SVC:${IMAGE_TAG}"
+            # Replace placeholder vars in manifest
+            sed -e "s|\$(ACR_NAME)|${{ env.ACR_LOGIN_SERVER }}|g" \
+                -e "s|\$(IMAGE_TAG)|${IMAGE_TAG}|g" \
+                k8s/services/${SVC}/deployment.yaml | kubectl apply -f -
+
+            kubectl apply -f k8s/services/${SVC}/hpa.yaml 2>/dev/null || true
+            kubectl apply -f k8s/services/${SVC}/pdb.yaml 2>/dev/null || true
+          done
+
+      - name: Apply ingress and network policies
+        run: |
+          kubectl apply -f k8s/ingress/ingress.yaml
+          kubectl apply -f k8s/services/networkpolicies.yaml
+
+      - name: Wait for rollouts to complete
+        run: |
+          for SVC in frontend user-service product-service order-service; do
+            echo "Waiting for $SVC..."
+            kubectl rollout status deployment/${SVC} -n ${{ env.K8S_NAMESPACE }} --timeout=180s
+          done
+          echo "✅ All deployments healthy"
+
+      - name: Verify deployment health
+        run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide
+          kubectl get services -n ${{ env.K8S_NAMESPACE }}
+          kubectl get hpa -n ${{ env.K8S_NAMESPACE }}
+
+          # Health check via kubectl port-forward
+          kubectl port-forward svc/user-service 3001:3001 -n ${{ env.K8S_NAMESPACE }} &
+          sleep 5
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health)
+          kill %1 2>/dev/null || true
+          if [ "$STATUS" != "200" ]; then
+            echo "❌ Health check failed (HTTP $STATUS) — rolling back"
+            kubectl rollout undo deployment/user-service -n ${{ env.K8S_NAMESPACE }}
+            exit 1
+          fi
+          echo "✅ Production deployment verified"
+
+      - name: Post deployment summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Image Tag | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          for SVC in frontend user-service product-service order-service; do
+            READY=$(kubectl get deployment/${SVC} -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.readyReplicas}')
+            echo "| ${SVC} | ${{ steps.tag.outputs.image_tag }} | ✅ ${READY} ready |" >> $GITHUB_STEP_SUMMARY
+          done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 6: Rollback (manual trigger on failure)
+# ─────────────────────────────────────────────────────────────────────────────
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: failure() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ env.AKS_RESOURCE_GROUP }} \
+            --name ${{ env.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      - name: Rollback all deployments
+        run: |
+          for SVC in frontend user-service product-service order-service; do
+            echo "Rolling back $SVC..."
+            kubectl rollout undo deployment/${SVC} -n ${{ env.K8S_NAMESPACE }}
+          done
+          echo "⏪ Rollback initiated for all services"
+
+      - name: Notify Slack on rollback
+        uses: slackapi/slack-github-action@v1
+        if: always()
+        with:
+          channel-id: '#devops-alerts'
+          slack-bot-token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: |
+            {"text":"⚠️ *AKS 3-Tier Deployment ROLLED BACK*\nBranch: `main` | SHA: `${{ github.sha }}`\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"}

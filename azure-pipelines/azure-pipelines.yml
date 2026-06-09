@@ -1,0 +1,247 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# AKS 3-Tier Architecture — Azure DevOps Pipelines
+# ═══════════════════════════════════════════════════════════════════════════════
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    exclude: ['*.md', 'docs/**']
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  ACR_NAME:           devops3tieracr
+  ACR_LOGIN_SERVER:   devops3tieracr.azurecr.io
+  AKS_RESOURCE_GROUP: rg-aks-3tier
+  AKS_CLUSTER_NAME:   aks-3tier-prod
+  K8S_NAMESPACE:      app
+  IMAGE_TAG:          $(Build.BuildId)
+  NODE_VERSION:       '20.x'
+
+stages:
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 1: Test
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: Test
+  displayName: 'Lint, Test & Security Scan'
+  jobs:
+
+  - job: UnitTests
+    displayName: 'Unit Tests (all services)'
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      parallel: 3
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: $(NODE_VERSION)
+
+    - script: |
+        SERVICES=(user-service product-service order-service)
+        IDX=$((SYSTEM_JOBPOSITIONINPHASE - 1))
+        SVC=${SERVICES[$IDX]}
+        echo "Testing $SVC"
+        cd services/$SVC
+        npm ci
+        npm test -- --passWithNoTests --ci
+      displayName: 'Run tests'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: '**/test-results.xml'
+        mergeTestResults: true
+      condition: always()
+
+  - job: SecurityScan
+    displayName: 'Trivy Security Scan'
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy fs --severity HIGH,CRITICAL --format sarif --output trivy.sarif . || true
+      displayName: 'Run Trivy filesystem scan'
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: trivy.sarif
+        ArtifactName: security-scan
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 2: Build & Push to ACR
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: Build
+  displayName: 'Build & Push Docker Images'
+  dependsOn: Test
+  condition: and(succeeded(), in(variables['Build.SourceBranch'], 'refs/heads/main', 'refs/heads/develop'))
+  jobs:
+
+  - job: BuildPush
+    displayName: 'Build & Push: $(SERVICE)'
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      matrix:
+        frontend:
+          SERVICE: frontend
+          CONTEXT: ./frontend
+        user_service:
+          SERVICE: user-service
+          CONTEXT: ./services/user-service
+        product_service:
+          SERVICE: product-service
+          CONTEXT: ./services/product-service
+        order_service:
+          SERVICE: order-service
+          CONTEXT: ./services/order-service
+    steps:
+    - task: Docker@2
+      displayName: 'Login to ACR'
+      inputs:
+        command: login
+        containerRegistry: 'ACR-Service-Connection'
+
+    - task: Docker@2
+      displayName: 'Build and Push $(SERVICE)'
+      inputs:
+        command: buildAndPush
+        containerRegistry: 'ACR-Service-Connection'
+        repository: $(SERVICE)
+        dockerfile: $(CONTEXT)/Dockerfile
+        context: $(CONTEXT)
+        tags: |
+          $(IMAGE_TAG)
+          latest
+          $(Build.SourceBranchName)
+
+    - script: |
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+        trivy image --severity CRITICAL --exit-code 0 $(ACR_LOGIN_SERVER)/$(SERVICE):$(IMAGE_TAG)
+      displayName: 'Scan image: $(SERVICE)'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 3: Deploy to Staging
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: DeployStaging
+  displayName: 'Deploy to AKS Staging'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/develop'))
+  jobs:
+  - deployment: DeployStaging
+    displayName: 'Deploy to staging namespace'
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'aks-staging'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Get AKS credentials'
+            inputs:
+              azureSubscription: 'Azure-DevOps-Portfolio'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group $(AKS_RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER_NAME) \
+                  --overwrite-existing
+
+          - task: Kubernetes@1
+            displayName: 'Deploy namespace + config'
+            inputs:
+              connectionType: None
+              command: apply
+              arguments: -f k8s/namespace/namespace.yaml -f k8s/configmaps/app-config.yaml
+
+          - script: |
+              for SVC in frontend user-service product-service order-service; do
+                sed -e "s|\$(ACR_NAME)|$(ACR_LOGIN_SERVER)|g" \
+                    -e "s|\$(IMAGE_TAG)|$(IMAGE_TAG)|g" \
+                    k8s/services/${SVC}/deployment.yaml | kubectl apply -f -
+              done
+              for DEP in frontend user-service product-service order-service; do
+                kubectl rollout status deployment/${DEP} -n $(K8S_NAMESPACE) --timeout=180s
+              done
+            displayName: 'Deploy all services'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STAGE 4: Deploy to Production
+# ─────────────────────────────────────────────────────────────────────────────
+- stage: DeployProduction
+  displayName: 'Deploy to AKS Production'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: DeployProduction
+    displayName: 'Rolling deploy to production'
+    pool:
+      vmImage: ubuntu-latest
+    environment: 'aks-production'   # Has manual approval gate in Azure DevOps
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Get AKS credentials'
+            inputs:
+              azureSubscription: 'Azure-DevOps-Portfolio'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group $(AKS_RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER_NAME) \
+                  --overwrite-existing
+
+          - script: |
+              kubectl apply -f k8s/namespace/namespace.yaml
+              kubectl apply -f k8s/configmaps/app-config.yaml
+              kubectl apply -f k8s/database/postgres-statefulset.yaml
+              kubectl apply -f k8s/redis/redis-statefulset.yaml
+              kubectl apply -f k8s/services/serviceaccount.yaml
+              kubectl rollout status statefulset/postgres -n $(K8S_NAMESPACE) --timeout=120s
+              kubectl rollout status statefulset/redis    -n $(K8S_NAMESPACE) --timeout=60s
+            displayName: 'Apply infra manifests'
+
+          - script: |
+              for SVC in frontend user-service product-service order-service; do
+                echo "▶ Deploying $SVC:$(IMAGE_TAG)"
+                sed -e "s|\$(ACR_NAME)|$(ACR_LOGIN_SERVER)|g" \
+                    -e "s|\$(IMAGE_TAG)|$(IMAGE_TAG)|g" \
+                    k8s/services/${SVC}/deployment.yaml | kubectl apply -f -
+                kubectl apply -f k8s/services/${SVC}/hpa.yaml 2>/dev/null || true
+                kubectl apply -f k8s/services/${SVC}/pdb.yaml 2>/dev/null || true
+              done
+            displayName: 'Deploy application services'
+
+          - script: |
+              kubectl apply -f k8s/ingress/ingress.yaml
+              kubectl apply -f k8s/services/networkpolicies.yaml
+            displayName: 'Apply ingress & network policies'
+
+          - script: |
+              for DEP in frontend user-service product-service order-service; do
+                kubectl rollout status deployment/${DEP} -n $(K8S_NAMESPACE) --timeout=180s
+              done
+              kubectl get pods,svc,hpa -n $(K8S_NAMESPACE)
+              echo "✅ Production deployment complete — tag: $(IMAGE_TAG)"
+            displayName: 'Verify rollouts'
+            
+        on:
+          failure:
+            steps:
+            - script: |
+                echo "❌ Deployment failed — rolling back all services"
+                for DEP in frontend user-service product-service order-service; do
+                  kubectl rollout undo deployment/${DEP} -n $(K8S_NAMESPACE)
+                done
+              displayName: 'Auto-rollback on failure'
